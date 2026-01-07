@@ -2,7 +2,7 @@
 """
 claim_event_analyzer.py
 
-Version: 1.1.1
+Version: 1.1.2
 
 What this app does
 ------------------
@@ -28,27 +28,28 @@ Install
 -------
 Python 3.10+ recommended (3.12 OK). Standard library only.
 
+Datetime parsing
+----------------
+Your timestamp format "M/D/CCYY HH:mm" is NOT ISO.
+
+Set in config:
+  "io": {
+    "datetime_format": "%m/%d/%Y %H:%M"
+  }
+
+If your data sometimes includes seconds, use:
+  "io": {
+    "datetime_formats": ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"]
+  }
+
 Typical usage
 -------------
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --out-csv findings.csv
 
-Debug input/header parsing (use this when you see header mismatch)
-------------------------------------------------------------------
+Debug input/header parsing
+--------------------------
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --debug-read --log-level DEBUG
-
-Why you’re seeing “missing fields” even though you “see them in the header”
----------------------------------------------------------------------------
-The most common real cause is delimiter mismatch.
-
-Example symptom:
-  Parsed header columns (1): ['EVENT_ID|PREV_EVENT_ID|CLM01|CREATE_DT|...']
-
-To a human, those column names are “right there” in that string.
-To the CSV parser, that is ONE column name because it never split the header line.
-
-Fix:
-  Set io.delimiter to the actual delimiter in the file (e.g. "|" or "," or "\\t").
 """
 
 from __future__ import annotations
@@ -63,11 +64,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 
 APP_NAME = "claim_event_analyzer"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 LOG = logging.getLogger(APP_NAME)
 
@@ -168,37 +169,10 @@ def _delimiter_diagnostics(header_line: str, configured: str) -> str:
 
 
 def _debug_header_chars(label: str, s: str) -> str:
-    """
-    Make invisible header issues obvious:
-      - shows repr
-      - shows code points for the first few chars
-    """
+    """Make invisible header issues obvious (repr + code points)."""
     s = s or ""
     cps = " ".join([f"U+{ord(ch):04X}" for ch in s[:40]])
     return f"{label}: repr={s!r} | first_chars_codepoints={cps}"
-
-
-def parse_datetime(value: str, fmt: str) -> datetime:
-    """
-    Parse a datetime string using either:
-      - explicit strptime format, or
-      - if fmt == "ISO", use datetime.fromisoformat
-    Returns an aware datetime in UTC.
-
-    Note: If an input datetime is naive (no tzinfo), we assume UTC in v1.x.
-    """
-    value = (value or "").strip()
-    if not value:
-        raise ValueError("created_at is blank")
-
-    if fmt.upper() == "ISO":
-        dt = datetime.fromisoformat(value)
-    else:
-        dt = datetime.strptime(value, fmt)
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 def _strip_surrounding_quotes(s: str) -> str:
@@ -224,11 +198,8 @@ def _normalize_header(name: str, match_mode: str) -> str:
     s = name.strip()
 
     if match_mode.lower() in ("normalized", "case_insensitive"):
-        # Sometimes headers come in as '"CLM01"' or with odd spacing.
         s = _strip_surrounding_quotes(s)
-        # remove common invisible/control characters that sneak in
         s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
-        # collapse whitespace
         s = re.sub(r"\s+", " ", s).strip()
 
     if match_mode.lower() in ("case_insensitive", "normalized"):
@@ -242,37 +213,76 @@ def _resolve_header(
     desired_header: str,
     match_mode: str,
 ) -> Optional[str]:
-    """
-    Given parsed headers from the file and a desired header from config,
-    find the actual header key used in DictReader row dicts.
-
-    Returns the matched actual header, or None if not found.
-    """
+    """Resolve config header name to actual header key in the parsed file."""
     desired_norm = _normalize_header(desired_header, match_mode)
     if not desired_norm:
         return None
 
     mapping: Dict[str, str] = {}
     for h in parsed_headers:
-        mapping[_normalize_header(h, match_mode)] = h  # last wins (headers should be unique)
+        mapping[_normalize_header(h, match_mode)] = h
 
     return mapping.get(desired_norm)
 
 
 def _maybe_sniff_delimiter(header_line: str, configured: str, enabled: bool) -> str:
-    """
-    Optional safety net: attempt to sniff delimiter from header line.
-    Uses csv.Sniffer with a restricted delimiter set.
-    """
+    """Optional safety net: attempt to sniff delimiter from header line."""
     if not enabled:
         return configured
-
     try:
         dialect = csv.Sniffer().sniff(header_line, delimiters="".join(COMMON_DELIMS))
         sniffed = getattr(dialect, "delimiter", configured)
         return sniffed or configured
     except Exception:
         return configured
+
+
+# -----------------------------
+# Datetime parsing
+# -----------------------------
+DateFmt = Union[str, Sequence[str]]
+
+
+def parse_datetime(value: str, fmts: DateFmt) -> datetime:
+    """
+    Parse a datetime string using:
+      - a single format string, or
+      - multiple formats (tries in order),
+      - special token "ISO" meaning datetime.fromisoformat.
+
+    Returns an aware datetime in UTC.
+
+    Note: If input is naive (no tzinfo), we assume UTC in v1.x.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("created_at is blank")
+
+    formats: List[str]
+    if isinstance(fmts, (list, tuple)):
+        formats = [str(x) for x in fmts]
+    else:
+        formats = [str(fmts)]
+
+    last_err: Optional[Exception] = None
+    for fmt in formats:
+        try:
+            if fmt.upper() == "ISO":
+                dt = datetime.fromisoformat(raw)
+            else:
+                dt = datetime.strptime(raw, fmt)
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise ValueError(
+        f"Could not parse created_at value {raw!r} using formats: {formats}. "
+        f"Last error: {last_err}"
+    )
 
 
 # -----------------------------
@@ -293,7 +303,12 @@ def read_events(
 
     configured_delimiter = _get(io_cfg, "delimiter", ",")
     encoding = _get(io_cfg, "encoding", "utf-8-sig")
-    dt_fmt = _get(io_cfg, "datetime_format", "ISO")
+
+    # v1.1.2: support datetime_formats (list) as preferred; fallback to datetime_format (single)
+    dt_formats = _get(io_cfg, "datetime_formats", None)
+    dt_format = _get(io_cfg, "datetime_format", "ISO")
+    dt_fmts: DateFmt = dt_formats if dt_formats else dt_format
+
     header_match_mode = _get(io_cfg, "header_match", "exact")  # exact|case_insensitive|normalized
     sniff_delimiter = bool(_get(io_cfg, "sniff_delimiter", False))
 
@@ -321,7 +336,8 @@ def read_events(
 
     if debug_read:
         LOG.info("Reading input: %s", str(input_path))
-        LOG.info("Configured delimiter: %r | encoding: %s | datetime_format: %s", configured_delimiter, encoding, dt_fmt)
+        LOG.info("Configured delimiter: %r | encoding: %s", configured_delimiter, encoding)
+        LOG.info("Datetime formats: %r", dt_fmts)
         LOG.info("Header match mode: %s | sniff_delimiter: %s", header_match_mode, sniff_delimiter)
         LOG.info("Configured base_len=%s suffix_len=%s", base_len, suffix_len)
         LOG.info("\n%s", _field_display(fields))
@@ -350,13 +366,11 @@ def read_events(
         if not reader.fieldnames:
             raise ValueError("Input appears to have no header row (DictReader.fieldnames is empty).")
 
-        # strip whitespace from headers
         parsed_headers = [(h.strip() if h is not None else "") for h in reader.fieldnames]
         reader.fieldnames = parsed_headers
 
         if debug_read:
             LOG.info("Parsed header columns (%d): %s", len(parsed_headers), parsed_headers)
-            # If it parsed only 1 header, call it out loudly (this is almost always delimiter mismatch)
             if len(parsed_headers) == 1 and any(d in parsed_headers[0] for d in COMMON_DELIMS):
                 LOG.warning(
                     "Parsed exactly 1 header column that still contains delimiter characters. "
@@ -391,7 +405,6 @@ def read_events(
             missing_required_actual.append(created_at_header_cfg)
 
         if missing_required_actual:
-            # Help the “but I see them right there!” scenario: show normalized header map keys
             norm_map_keys = sorted({_normalize_header(h, header_match_mode) for h in parsed_headers if h})
             raise ValueError(
                 "Header validation failed.\n"
@@ -414,27 +427,6 @@ def read_events(
         cms_icn_h = _resolve_header(parsed_headers, cms_icn_header_cfg, header_match_mode) if cms_icn_header_cfg else None
         cms_out_icn_h = _resolve_header(parsed_headers, cms_out_icn_header_cfg, header_match_mode) if cms_out_icn_header_cfg else None
 
-        if debug_read:
-            LOG.info(
-                "Resolved optional headers:\n"
-                "  prev_pk        cfg=%r -> actual=%r\n"
-                "  ref_f8         cfg=%r -> actual=%r\n"
-                "  system_state   cfg=%r -> actual=%r\n"
-                "  system_status  cfg=%r -> actual=%r\n"
-                "  clm0503        cfg=%r -> actual=%r\n"
-                "  system_clm0503 cfg=%r -> actual=%r\n"
-                "  cms_icn        cfg=%r -> actual=%r\n"
-                "  cms_out_icn    cfg=%r -> actual=%r",
-                prev_pk_header_cfg, prev_h,
-                ref_f8_header_cfg, ref_f8_h,
-                system_state_header_cfg, sys_state_h,
-                system_status_header_cfg, sys_status_h,
-                clm0503_header_cfg, clm0503_h,
-                system_clm0503_header_cfg, sys_clm0503_h,
-                cms_icn_header_cfg, cms_icn_h,
-                cms_out_icn_header_cfg, cms_out_icn_h,
-            )
-
         events: List[Event] = []
         total_rows = 0
         emitted = 0
@@ -443,8 +435,6 @@ def read_events(
 
         for row in reader:
             total_rows += 1
-
-            # normalize keys: strip (extra safety)
             row = {(k.strip() if k else k): v for k, v in row.items()}
 
             pk = (row.get(pk_h, "") or "").strip()
@@ -465,7 +455,7 @@ def read_events(
                     f"Check your mapping: pk -> {pk_header_cfg!r}."
                 )
 
-            created_at = parse_datetime(created_at_raw, dt_fmt)
+            created_at = parse_datetime(created_at_raw, dt_fmts)
 
             base_id = clm01_full[:base_len]
             clm_suffix = clm01_full[base_len:base_len + suffix_len] if len(clm01_full) >= base_len else ""
@@ -512,12 +502,7 @@ def read_events(
 # Thread building (PK chains)
 # -----------------------------
 def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Finding]]:
-    """
-    Build threads using prev_pk links.
-    Returns:
-      - list of threads (each is ordered PK list)
-      - findings about missing references / cycles / splits
-    """
+    """Build threads using prev_pk links; return threads + structural findings."""
     findings: List[Finding] = []
 
     by_pk: Dict[str, Event] = {e.pk: e for e in events_sorted}
@@ -540,7 +525,6 @@ def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Fin
         else:
             roots.append(e.pk)
 
-    # Deduplicate roots while preserving event order
     seen: Set[str] = set()
     roots_ordered: List[str] = []
     for e in events_sorted:
@@ -551,7 +535,6 @@ def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Fin
     threads: List[List[str]] = []
 
     def dfs(path: List[str], current_pk: str) -> None:
-        """Depth-first expansion to enumerate thread paths, splitting when multiple children exist."""
         kids = children.get(current_pk, [])
         if not kids:
             threads.append(path[:])
@@ -589,13 +572,12 @@ def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Fin
 # -----------------------------
 # Rules
 # -----------------------------
+def _must_rules(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return _must(cfg, "rules")
+
+
 def rule_expected_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    Typical expectation:
-      - suffix '00' should eventually reach an “ACCEPTED”-like status.
-    If not seen, warn.
-    """
-    rules_cfg = _must(cfg, "rules")
+    rules_cfg = _must_rules(cfg)
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     expected_suffix = str(_get(rules_cfg, "expected_suffix", "00")).strip()
 
@@ -626,11 +608,7 @@ def rule_expected_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) ->
 
 
 def rule_locked_before_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    Detect LOCKED events that occurred before the first accepted event timestamp.
-    Often indicates a later action arrived while earlier processing hadn't completed.
-    """
-    rules_cfg = _must(cfg, "rules")
+    rules_cfg = _must_rules(cfg)
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
 
@@ -655,10 +633,6 @@ def rule_locked_before_acceptance(events_sorted: List[Event], cfg: Dict[str, Any
 
 
 def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    For CLM05-3 = 7 or 8, expect REF*F8 to be populated.
-    Checks both inbound clm0503 and system_clm0503 (if present).
-    """
     _ = cfg
     findings: List[Finding] = []
     for e in events_sorted:
@@ -677,7 +651,6 @@ def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, 
 
 
 def rule_system_freq_differs(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """Informational: system-altered frequency code differs from inbound frequency code."""
     _ = cfg
     findings: List[Finding] = []
     for e in events_sorted:
@@ -705,7 +678,6 @@ RULES = [
 # Digest + summary
 # -----------------------------
 def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
-    """Group events by base_id, order by created_at, build threads, run rules, and return reports."""
     grouped: Dict[str, List[Event]] = defaultdict(list)
     for e in events:
         grouped[e.base_id].append(e)
@@ -744,18 +716,13 @@ def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
 
 
 def _count_findings(findings: Iterable[Finding]) -> Dict[str, int]:
-    """Count findings by severity."""
     out = {"ERROR": 0, "WARN": 0, "INFO": 0}
     for f in findings:
-        if f.severity in out:
-            out[f.severity] += 1
-        else:
-            out[f.severity] = out.get(f.severity, 0) + 1
+        out[f.severity] = out.get(f.severity, 0) + 1
     return out
 
 
 def _headline_for_base(findings: List[Finding]) -> str:
-    """Pick a single headline issue for a base_id."""
     if not findings:
         return "OK"
     for sev in ("ERROR", "WARN", "INFO"):
@@ -766,12 +733,10 @@ def _headline_for_base(findings: List[Finding]) -> str:
 
 
 def _has_status(events: List[Event], values: Set[str]) -> bool:
-    """True if any event has a system_status in the provided set."""
     return any(e.system_status in values for e in events)
 
 
 def _latest_nonblank(values: List[str]) -> str:
-    """Return latest nonblank string from a list (or blank)."""
     for v in reversed(values):
         if v:
             return v
@@ -779,7 +744,6 @@ def _latest_nonblank(values: List[str]) -> str:
 
 
 def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert reports to JSON-serializable structure with top-level summary + per-base details."""
     rules_cfg = _must(cfg, "rules")
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
@@ -863,7 +827,6 @@ def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str
 
 
 def write_findings_csv(reports: List[BaseGroupReport], out_path: Path) -> None:
-    """Write a flat findings CSV for easy filtering/sorting."""
     rows: List[Dict[str, str]] = []
     for r in reports:
         for f in r.findings:
@@ -887,7 +850,6 @@ def write_findings_csv(reports: List[BaseGroupReport], out_path: Path) -> None:
 # CLI
 # -----------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """CLI argument parsing."""
     p = argparse.ArgumentParser(prog=APP_NAME)
     p.add_argument("--config", required=True, help="Path to config JSON.")
     p.add_argument("--input", required=True, help="Path to input delimited file.")
@@ -899,19 +861,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def configure_logging(level: str) -> None:
-    """Configure console logging."""
     lvl = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(level=lvl, format="%(levelname)s %(message)s")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Main entry point."""
     args = parse_args(argv)
     configure_logging(args.log_level)
 
     print(f"{APP_NAME} v{APP_VERSION}")
-    LOG.info("Using config: %s", str(Path(args.config).resolve()))
-    LOG.info("Using input:  %s", str(Path(args.input).resolve()))
 
     cfg_path = Path(args.config)
     in_path = Path(args.input)
@@ -921,8 +879,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise FileNotFoundError(f"Config not found: {cfg_path}")
 
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    events = read_events(in_path, cfg, debug_read=args.debug_read)
 
+    events = read_events(in_path, cfg, debug_read=args.debug_read)
     if not events:
         LOG.warning(
             "No events were emitted after parsing. This usually means CLM01 is blank for all rows, "
@@ -933,7 +891,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_json = to_jsonable(reports, cfg)
 
     out_path.write_text(json.dumps(out_json, indent=2), encoding="utf-8")
-
     if args.out_csv:
         write_findings_csv(reports, Path(args.out_csv))
 
