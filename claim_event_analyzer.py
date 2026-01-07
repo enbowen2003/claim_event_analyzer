@@ -2,7 +2,7 @@
 """
 claim_event_analyzer.py
 
-Version: 1.1.0
+Version: 1.1.1
 
 What this app does
 ------------------
@@ -33,9 +33,22 @@ Typical usage
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --out-csv findings.csv
 
-Debug input/header parsing (highly recommended if you saw empty bases)
----------------------------------------------------------------------
+Debug input/header parsing (use this when you see header mismatch)
+------------------------------------------------------------------
 python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --debug-read --log-level DEBUG
+
+Why you’re seeing “missing fields” even though you “see them in the header”
+---------------------------------------------------------------------------
+The most common real cause is delimiter mismatch.
+
+Example symptom:
+  Parsed header columns (1): ['EVENT_ID|PREV_EVENT_ID|CLM01|CREATE_DT|...']
+
+To a human, those column names are “right there” in that string.
+To the CSV parser, that is ONE column name because it never split the header line.
+
+Fix:
+  Set io.delimiter to the actual delimiter in the file (e.g. "|" or "," or "\\t").
 """
 
 from __future__ import annotations
@@ -45,7 +58,7 @@ import csv
 import dataclasses
 import json
 import logging
-import sys
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,7 +67,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 APP_NAME = "claim_event_analyzer"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 LOG = logging.getLogger(APP_NAME)
 
@@ -149,9 +162,20 @@ def _delimiter_diagnostics(header_line: str, configured: str) -> str:
         if best[1] > 0:
             parts.append(
                 f"Configured delimiter {repr(configured)} does not appear in the header line, "
-                f"but {repr(best[0])} appears {best[1]} times. Check your config."
+                f"but {repr(best[0])} appears {best[1]} times. Check your io.delimiter."
             )
     return "\n".join(parts)
+
+
+def _debug_header_chars(label: str, s: str) -> str:
+    """
+    Make invisible header issues obvious:
+      - shows repr
+      - shows code points for the first few chars
+    """
+    s = s or ""
+    cps = " ".join([f"U+{ord(ch):04X}" for ch in s[:40]])
+    return f"{label}: repr={s!r} | first_chars_codepoints={cps}"
 
 
 def parse_datetime(value: str, fmt: str) -> datetime:
@@ -162,7 +186,6 @@ def parse_datetime(value: str, fmt: str) -> datetime:
     Returns an aware datetime in UTC.
 
     Note: If an input datetime is naive (no tzinfo), we assume UTC in v1.x.
-    If you want Chicago-local interpretation + DST rules, we can add zoneinfo in a later version.
     """
     value = (value or "").strip()
     if not value:
@@ -178,19 +201,39 @@ def parse_datetime(value: str, fmt: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _strip_surrounding_quotes(s: str) -> str:
+    """Remove one layer of surrounding single/double quotes if present."""
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        return s[1:-1]
+    return s
+
+
 def _normalize_header(name: str, match_mode: str) -> str:
     """
     Normalize a header name for matching.
 
     match_mode:
-      - "exact": only strip whitespace (for safety)
+      - "exact": strip whitespace only
       - "case_insensitive": strip + lowercase
+      - "normalized": strip + remove surrounding quotes + collapse whitespace + lowercase +
+                      remove a few common invisible chars (BOM, NBSP, ZWSP)
     """
     if name is None:
         return ""
+
     s = name.strip()
-    if match_mode.lower() == "case_insensitive":
-        return s.lower()
+
+    if match_mode.lower() in ("normalized", "case_insensitive"):
+        # Sometimes headers come in as '"CLM01"' or with odd spacing.
+        s = _strip_surrounding_quotes(s)
+        # remove common invisible/control characters that sneak in
+        s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+        # collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+
+    if match_mode.lower() in ("case_insensitive", "normalized"):
+        s = s.lower()
+
     return s
 
 
@@ -211,9 +254,25 @@ def _resolve_header(
 
     mapping: Dict[str, str] = {}
     for h in parsed_headers:
-        mapping[_normalize_header(h, match_mode)] = h  # last wins, but headers should be unique
+        mapping[_normalize_header(h, match_mode)] = h  # last wins (headers should be unique)
 
     return mapping.get(desired_norm)
+
+
+def _maybe_sniff_delimiter(header_line: str, configured: str, enabled: bool) -> str:
+    """
+    Optional safety net: attempt to sniff delimiter from header line.
+    Uses csv.Sniffer with a restricted delimiter set.
+    """
+    if not enabled:
+        return configured
+
+    try:
+        dialect = csv.Sniffer().sniff(header_line, delimiters="".join(COMMON_DELIMS))
+        sniffed = getattr(dialect, "delimiter", configured)
+        return sniffed or configured
+    except Exception:
+        return configured
 
 
 # -----------------------------
@@ -232,15 +291,16 @@ def read_events(
     fields = _must(cfg, "fields")
     grouping = _must(cfg, "grouping")
 
-    delimiter = _get(io_cfg, "delimiter", ",")
+    configured_delimiter = _get(io_cfg, "delimiter", ",")
     encoding = _get(io_cfg, "encoding", "utf-8-sig")
     dt_fmt = _get(io_cfg, "datetime_format", "ISO")
-    header_match_mode = _get(io_cfg, "header_match", "exact")  # "exact" | "case_insensitive"
+    header_match_mode = _get(io_cfg, "header_match", "exact")  # exact|case_insensitive|normalized
+    sniff_delimiter = bool(_get(io_cfg, "sniff_delimiter", False))
 
     base_len = int(_get(grouping, "base_len", 10))
     suffix_len = int(_get(grouping, "suffix_len", 2))
 
-    # internal -> config-right-side input header names
+    # internal -> configured input header names
     pk_header_cfg = _must(fields, "pk")
     clm01_header_cfg = _must(fields, "clm01_full")
     created_at_header_cfg = _must(fields, "created_at")
@@ -261,10 +321,13 @@ def read_events(
 
     if debug_read:
         LOG.info("Reading input: %s", str(input_path))
-        LOG.info("Configured delimiter: %r | encoding: %s | datetime_format: %s", delimiter, encoding, dt_fmt)
-        LOG.info("Header match mode: %s", header_match_mode)
+        LOG.info("Configured delimiter: %r | encoding: %s | datetime_format: %s", configured_delimiter, encoding, dt_fmt)
+        LOG.info("Header match mode: %s | sniff_delimiter: %s", header_match_mode, sniff_delimiter)
         LOG.info("Configured base_len=%s suffix_len=%s", base_len, suffix_len)
         LOG.info("\n%s", _field_display(fields))
+        LOG.info(_debug_header_chars("cfg.pk", pk_header_cfg))
+        LOG.info(_debug_header_chars("cfg.clm01_full", clm01_header_cfg))
+        LOG.info(_debug_header_chars("cfg.created_at", created_at_header_cfg))
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
@@ -276,7 +339,11 @@ def read_events(
 
         if debug_read:
             LOG.info("Raw header line (first 300 chars): %r", header_line[:300])
-            LOG.info("%s", _delimiter_diagnostics(header_line, delimiter))
+            LOG.info("%s", _delimiter_diagnostics(header_line, configured_delimiter))
+
+        delimiter = _maybe_sniff_delimiter(header_line, configured_delimiter, sniff_delimiter)
+        if debug_read and delimiter != configured_delimiter:
+            LOG.warning("Delimiter sniffed %r (overriding configured %r) based on header line.", delimiter, configured_delimiter)
 
         f.seek(0)
         reader = csv.DictReader(f, delimiter=delimiter)
@@ -289,8 +356,17 @@ def read_events(
 
         if debug_read:
             LOG.info("Parsed header columns (%d): %s", len(parsed_headers), parsed_headers)
+            # If it parsed only 1 header, call it out loudly (this is almost always delimiter mismatch)
+            if len(parsed_headers) == 1 and any(d in parsed_headers[0] for d in COMMON_DELIMS):
+                LOG.warning(
+                    "Parsed exactly 1 header column that still contains delimiter characters. "
+                    "This strongly suggests delimiter mismatch. Parsed header[0]=%r",
+                    parsed_headers[0],
+                )
+            for i, h in enumerate(parsed_headers[:25]):
+                LOG.info(_debug_header_chars(f"header[{i}]", h))
 
-        # resolve configured header names to actual parsed headers (supports case-insensitive)
+        # resolve configured headers to actual parsed headers
         pk_h = _resolve_header(parsed_headers, pk_header_cfg, header_match_mode)
         clm01_h = _resolve_header(parsed_headers, clm01_header_cfg, header_match_mode)
         created_h = _resolve_header(parsed_headers, created_at_header_cfg, header_match_mode)
@@ -298,12 +374,12 @@ def read_events(
         if debug_read:
             LOG.info(
                 "Resolved required headers:\n"
-                "  pk         cfg=%r -> actual=%r\n"
-                "  clm01_full  cfg=%r -> actual=%r\n"
-                "  created_at  cfg=%r -> actual=%r",
-                pk_header_cfg, pk_h,
-                clm01_header_cfg, clm01_h,
-                created_at_header_cfg, created_h,
+                "  pk         cfg=%r norm=%r -> actual=%r\n"
+                "  clm01_full  cfg=%r norm=%r -> actual=%r\n"
+                "  created_at  cfg=%r norm=%r -> actual=%r",
+                pk_header_cfg, _normalize_header(pk_header_cfg, header_match_mode), pk_h,
+                clm01_header_cfg, _normalize_header(clm01_header_cfg, header_match_mode), clm01_h,
+                created_at_header_cfg, _normalize_header(created_at_header_cfg, header_match_mode), created_h,
             )
 
         missing_required_actual: List[str] = []
@@ -315,13 +391,17 @@ def read_events(
             missing_required_actual.append(created_at_header_cfg)
 
         if missing_required_actual:
+            # Help the “but I see them right there!” scenario: show normalized header map keys
+            norm_map_keys = sorted({_normalize_header(h, header_match_mode) for h in parsed_headers if h})
             raise ValueError(
                 "Header validation failed.\n"
                 f"Missing required input column(s): {missing_required_actual}\n"
-                f"Header columns seen: {parsed_headers}\n\n"
+                f"Delimiter used: {delimiter!r} (configured: {configured_delimiter!r})\n"
+                f"Header columns seen ({len(parsed_headers)}): {parsed_headers}\n\n"
                 f"{_field_display(fields)}\n\n"
-                "Tip: If the names match but differ only by case, set io.header_match to \"case_insensitive\".\n"
-                "Tip: If the delimiter is wrong, fix io.delimiter."
+                f"Normalized header keys seen (mode={header_match_mode}): {norm_map_keys}\n\n"
+                "Most common cause: delimiter mismatch. If header columns show as ONE big string, fix io.delimiter.\n"
+                "If it’s a case/quotes/whitespace issue, set io.header_match to \"case_insensitive\" or \"normalized\"."
             )
 
         # resolve optional headers
@@ -364,7 +444,7 @@ def read_events(
         for row in reader:
             total_rows += 1
 
-            # normalize keys: strip (DictReader uses fieldnames; this is just extra safety)
+            # normalize keys: strip (extra safety)
             row = {(k.strip() if k else k): v for k, v in row.items()}
 
             pk = (row.get(pk_h, "") or "").strip()
@@ -579,7 +659,7 @@ def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, 
     For CLM05-3 = 7 or 8, expect REF*F8 to be populated.
     Checks both inbound clm0503 and system_clm0503 (if present).
     """
-    _ = cfg  # reserved for future rule toggles
+    _ = cfg
     findings: List[Finding] = []
     for e in events_sorted:
         freq_candidates = {e.clm0503.strip(), e.system_clm0503.strip()}
@@ -645,7 +725,6 @@ def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
         created_min = min(e.created_at for e in group_sorted)
         created_max = max(e.created_at for e in group_sorted)
 
-        # stable ordering of findings (severity first, then code)
         severity_rank = {"ERROR": 0, "WARN": 1, "INFO": 2}
         findings_sorted = sorted(findings, key=lambda f: (severity_rank.get(f.severity, 9), f.code, f.message))
 
@@ -700,7 +779,7 @@ def _latest_nonblank(values: List[str]) -> str:
 
 
 def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert reports to a JSON-serializable structure with a top-level summary + per-base details."""
+    """Convert reports to JSON-serializable structure with top-level summary + per-base details."""
     rules_cfg = _must(cfg, "rules")
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
@@ -831,6 +910,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_logging(args.log_level)
 
     print(f"{APP_NAME} v{APP_VERSION}")
+    LOG.info("Using config: %s", str(Path(args.config).resolve()))
+    LOG.info("Using input:  %s", str(Path(args.input).resolve()))
 
     cfg_path = Path(args.config)
     in_path = Path(args.input)
@@ -860,7 +941,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.out_csv:
         print(f"Wrote findings CSV: {args.out_csv}")
 
-    # small console summary (the JSON has the full summary section)
     summ = out_json.get("summary", {})
     print(
         f"Bases: {summ.get('base_count', 0)} | "
@@ -868,7 +948,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"Findings: {summ.get('findings_total', 0)} | "
         f"WARN/ERROR bases: {summ.get('bases_with_warn_or_error', 0)}"
     )
-
     return 0
 
 
