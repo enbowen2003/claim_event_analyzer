@@ -2,38 +2,32 @@
 """
 claim_event_analyzer.py
 
-Version: 1.2.0
+Version: 1.3.0
 
-What this app does
-------------------
-Reads row-based “claim event” data (CSV/TSV/pipe/etc), groups events by a configurable
-“base” portion of a claim identifier (business-wise: derived from EDI 837 CLM01),
-and produces a report that includes:
+Goals for v1.3.0
+----------------
+- CSV is the primary (default) output. JSON is removed to avoid confusion.
+- Output is consistent: the same "pertinent field data" is what you get in CSV.
+- Add rule logic that understands events in relation to other PKs in the same base_id "family".
+- Keep it less wordy: findings are compact (codes + short note).
 
-1) A top-level SUMMARY:
-   - totals across all base_ids
-   - a per-base rollup row (base_id, first/last timestamps, latest status/state, headline issue, etc.)
+Core idea
+---------
+We group events by a configurable base_id derived from CLM01 (first N chars),
+then order events by created_at and build a family context timeline so per-event
+classification can reference prior events.
 
-2) Per-base DETAILS:
-   - ordered events
-   - a compact TIMELINE (CLM01 + timestamp + state/status + derived action)
-   - prev_pk thread chains
-   - rule-based findings (warnings/errors/infos)
+Outputs
+-------
+1) Events CSV (required): one row per event, includes:
+   - core tracked fields (CLM01, timestamp, state, status, etc.)
+   - assessment_severity (OK/WARN/ERROR)
+   - understanding_confidence (HIGH/MED/LOW)
+   - assessment_codes (semicolon-delimited)
+   - assessment_note (short)
+   - related_pk (e.g., inflight pk that the LOCKED event is waiting on)
 
-Important behavioral note
--------------------------
-We do NOT assume state/status can be “understood” from an event row in isolation.
-We compute some derived context at the BASE-ID level (e.g., acceptance timestamp),
-and then attach per-event "tags" / "classification" that can rely on that context.
-
-New in v1.2.0
--------------
-- JSON now includes, per base_id:
-  - timeline[]: each item includes clm01_full, created_at, system_state, system_status,
-    effective_clm0503/action_type, and derived classification_tags.
-- Adds a rule that flags events that appear "unclassifiable" (UNKNOWN_EVENT_CLASSIFICATION),
-  i.e., the analyzer can’t assign any meaningful tags based on the current rules + context.
-- Adds configurable "ignores" to filter findings by code and/or severity.
+2) Base summary CSV (default alongside events CSV): one row per base_id family
 
 Install
 -------
@@ -41,16 +35,34 @@ Python 3.10+ recommended (3.12 OK). Standard library only.
 
 Usage
 -----
-python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json
-python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json --out-csv findings.csv
-python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json --debug-read --log-level DEBUG
+python claim_event_analyzer.py --version
+
+python claim_event_analyzer.py \
+  --config config.claims.json \
+  --input events.txt \
+  --out events_report.csv
+
+Optional:
+  --out-bases base_summary.csv
+  --debug-read --log-level DEBUG
+  --print-base 1234567890   (prints a short console timeline for one base_id)
+
+Config mapping reminder
+-----------------------
+"fields" maps INTERNAL FIELD NAME (left) -> INPUT FILE HEADER (right).
+
+Example:
+  "fields": {
+    "pk": "EVENT_ID",
+    "clm01_full": "CLM01",
+    "created_at": "CREATE_DT"
+  }
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import dataclasses
 import json
 import logging
 import re
@@ -58,15 +70,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 
 APP_NAME = "claim_event_analyzer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 LOG = logging.getLogger(APP_NAME)
 
-COMMON_DELIMS: Sequence[str] = [",", "|", "\t", ";"]
+COMMON_DELIMS: Sequence[str] = [",", "|", "\\t", ";"]
 
 
 # -----------------------------
@@ -74,10 +86,11 @@ COMMON_DELIMS: Sequence[str] = [",", "|", "\t", ";"]
 # -----------------------------
 @dataclass(frozen=True)
 class Event:
-    """A single inbound row normalized into typed fields used for diagnostics."""
+    """One inbound row normalized into typed fields used for diagnostics."""
+    rownum: int
+
     base_id: str
     clm01_full: str
-    clm_suffix: str
 
     pk: str
     prev_pk: str
@@ -93,30 +106,40 @@ class Event:
     cms_icn: str
     cms_out_icn: str
 
+    create_by: str
+    update_by: str
+
     created_at: datetime
 
     raw: Dict[str, str]
 
 
 @dataclass(frozen=True)
-class Finding:
-    """A diagnostic produced by a rule."""
-    code: str
-    severity: str  # INFO/WARN/ERROR
-    message: str
-    related_pks: Tuple[str, ...] = ()
-    related_rows: Tuple[int, ...] = ()
+class AssessedEvent:
+    """An Event plus compact assessment results."""
+    event: Event
+    assessment_severity: str         # OK/WARN/ERROR
+    understanding_confidence: str    # HIGH/MED/LOW
+    assessment_codes: str            # ';' delimited codes
+    assessment_note: str             # short note
+    related_pk: str                  # e.g., inflight pk
 
 
-@dataclass
-class BaseGroupReport:
-    """Report for one base_id."""
+@dataclass(frozen=True)
+class BaseSummary:
     base_id: str
-    created_min: datetime
-    created_max: datetime
-    events_sorted: List[Event]
-    threads: List[List[str]]
-    findings: List[Finding]
+    event_count: int
+    created_min_utc: str
+    created_max_utc: str
+    manual_flag: str
+
+    first_terminal_utc: str
+    terminal_statuses_seen: str
+
+    has_locked: str
+
+    headline_severity: str
+    headline_code: str
 
 
 # -----------------------------
@@ -134,23 +157,18 @@ def _get(d: Dict[str, Any], key: str, default: Any) -> Any:
     return d.get(key, default)
 
 
-def _required_internal_fields() -> Set[str]:
-    """Internal logical fields required for the app to function."""
-    return {"pk", "clm01_full", "created_at"}
-
-
 def _field_display(cfg_fields: Dict[str, str]) -> str:
     """Pretty display of internal->input header mapping for logs/errors."""
     lines = ["Field mapping (internal -> input header):"]
     longest = max((len(k) for k in cfg_fields.keys()), default=0)
     for k in sorted(cfg_fields.keys()):
         lines.append(f"  {k:<{longest}} -> {cfg_fields[k]}")
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 
 def _delimiter_diagnostics(header_line: str, configured: str) -> str:
     """Heuristic: counts of common delimiters in the header line to detect mismatch."""
-    counts = {d: header_line.count(d) for d in COMMON_DELIMS}
+    counts = {d: header_line.count(d) for d in [",", "|", "\\t", ";"]}
     parts = ["Header delimiter counts: " + ", ".join([f"{repr(k)}={v}" for k, v in counts.items()])]
     if counts.get(configured, 0) == 0:
         best = max(counts.items(), key=lambda kv: kv[1])
@@ -159,14 +177,7 @@ def _delimiter_diagnostics(header_line: str, configured: str) -> str:
                 f"Configured delimiter {repr(configured)} does not appear in the header line, "
                 f"but {repr(best[0])} appears {best[1]} times. Check your io.delimiter."
             )
-    return "\n".join(parts)
-
-
-def _debug_header_chars(label: str, s: str) -> str:
-    """Make invisible header issues obvious (repr + code points)."""
-    s = s or ""
-    cps = " ".join([f"U+{ord(ch):04X}" for ch in s[:40]])
-    return f"{label}: repr={s!r} | first_chars_codepoints={cps}"
+    return "\\n".join(parts)
 
 
 def _strip_surrounding_quotes(s: str) -> str:
@@ -193,8 +204,8 @@ def _normalize_header(name: str, match_mode: str) -> str:
 
     if match_mode.lower() in ("normalized", "case_insensitive"):
         s = _strip_surrounding_quotes(s)
-        s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
-        s = re.sub(r"\s+", " ", s).strip()
+        s = s.replace("\\ufeff", "").replace("\\u200b", "").replace("\\xa0", " ")
+        s = re.sub(r"\\s+", " ", s).strip()
 
     if match_mode.lower() in ("case_insensitive", "normalized"):
         s = s.lower()
@@ -202,11 +213,7 @@ def _normalize_header(name: str, match_mode: str) -> str:
     return s
 
 
-def _resolve_header(
-    parsed_headers: List[str],
-    desired_header: str,
-    match_mode: str,
-) -> Optional[str]:
+def _resolve_header(parsed_headers: List[str], desired_header: str, match_mode: str) -> Optional[str]:
     """Resolve config header name to actual header key in the parsed file."""
     desired_norm = _normalize_header(desired_header, match_mode)
     if not desired_norm:
@@ -224,7 +231,7 @@ def _maybe_sniff_delimiter(header_line: str, configured: str, enabled: bool) -> 
     if not enabled:
         return configured
     try:
-        dialect = csv.Sniffer().sniff(header_line, delimiters="".join(COMMON_DELIMS))
+        dialect = csv.Sniffer().sniff(header_line, delimiters=",|\\t;")
         sniffed = getattr(dialect, "delimiter", configured)
         return sniffed or configured
     except Exception:
@@ -281,14 +288,10 @@ def parse_datetime(value: str, fmts: DateFmt) -> datetime:
 # -----------------------------
 # Input reading
 # -----------------------------
-def read_events(
-    input_path: Path,
-    cfg: Dict[str, Any],
-    debug_read: bool = False,
-) -> List[Event]:
+def read_events(input_path: Path, cfg: Dict[str, Any], debug_read: bool = False) -> List[Event]:
     """
     Read input rows and normalize into Event objects.
-    Produces rich debug output (header + mapping resolution + sample rows) when debug_read=True.
+    Includes strong header validation + delimiter diagnostics.
     """
     io_cfg = _must(cfg, "io")
     fields = _must(cfg, "fields")
@@ -297,7 +300,6 @@ def read_events(
     configured_delimiter = _get(io_cfg, "delimiter", ",")
     encoding = _get(io_cfg, "encoding", "utf-8-sig")
 
-    # supports datetime_formats (list) as preferred; fallback to datetime_format (single)
     dt_formats = _get(io_cfg, "datetime_formats", None)
     dt_format = _get(io_cfg, "datetime_format", "ISO")
     dt_fmts: DateFmt = dt_formats if dt_formats else dt_format
@@ -306,13 +308,13 @@ def read_events(
     sniff_delimiter = bool(_get(io_cfg, "sniff_delimiter", False))
 
     base_len = int(_get(grouping, "base_len", 10))
-    suffix_len = int(_get(grouping, "suffix_len", 2))
 
-    # internal -> configured input header names
+    # Required mappings
     pk_header_cfg = _must(fields, "pk")
     clm01_header_cfg = _must(fields, "clm01_full")
     created_at_header_cfg = _must(fields, "created_at")
 
+    # Optional mappings
     prev_pk_header_cfg = _get(fields, "prev_pk", "")
     ref_f8_header_cfg = _get(fields, "ref_f8", "")
     system_state_header_cfg = _get(fields, "system_state", "")
@@ -321,21 +323,16 @@ def read_events(
     system_clm0503_header_cfg = _get(fields, "system_clm0503", "")
     cms_icn_header_cfg = _get(fields, "cms_icn", "")
     cms_out_icn_header_cfg = _get(fields, "cms_out_icn", "")
-
-    missing_internal = [k for k in _required_internal_fields() if k not in fields]
-    if missing_internal:
-        raise ValueError(f"Config missing required internal mapping(s): {missing_internal}")
+    create_by_header_cfg = _get(fields, "create_by", "")
+    update_by_header_cfg = _get(fields, "update_by", "")
 
     if debug_read:
         LOG.info("Reading input: %s", str(input_path))
         LOG.info("Configured delimiter: %r | encoding: %s", configured_delimiter, encoding)
         LOG.info("Datetime formats: %r", dt_fmts)
         LOG.info("Header match mode: %s | sniff_delimiter: %s", header_match_mode, sniff_delimiter)
-        LOG.info("Configured base_len=%s suffix_len=%s", base_len, suffix_len)
-        LOG.info("\n%s", _field_display(fields))
-        LOG.info(_debug_header_chars("cfg.pk", pk_header_cfg))
-        LOG.info(_debug_header_chars("cfg.clm01_full", clm01_header_cfg))
-        LOG.info(_debug_header_chars("cfg.created_at", created_at_header_cfg))
+        LOG.info("Configured base_len=%s", base_len)
+        LOG.info("\\n%s", _field_display(fields))
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
@@ -363,53 +360,38 @@ def read_events(
 
         if debug_read:
             LOG.info("Parsed header columns (%d): %s", len(parsed_headers), parsed_headers)
-            if len(parsed_headers) == 1 and any(d in parsed_headers[0] for d in COMMON_DELIMS):
+            if len(parsed_headers) == 1 and any(d in parsed_headers[0] for d in [",", "|", "\\t", ";"]):
                 LOG.warning(
                     "Parsed exactly 1 header column that still contains delimiter characters. "
                     "This strongly suggests delimiter mismatch. Parsed header[0]=%r",
                     parsed_headers[0],
                 )
-            for i, h in enumerate(parsed_headers[:25]):
-                LOG.info(_debug_header_chars(f"header[{i}]", h))
 
-        # resolve required headers
+        # Resolve required headers
         pk_h = _resolve_header(parsed_headers, pk_header_cfg, header_match_mode)
         clm01_h = _resolve_header(parsed_headers, clm01_header_cfg, header_match_mode)
         created_h = _resolve_header(parsed_headers, created_at_header_cfg, header_match_mode)
 
-        if debug_read:
-            LOG.info(
-                "Resolved required headers:\n"
-                "  pk         cfg=%r norm=%r -> actual=%r\n"
-                "  clm01_full  cfg=%r norm=%r -> actual=%r\n"
-                "  created_at  cfg=%r norm=%r -> actual=%r",
-                pk_header_cfg, _normalize_header(pk_header_cfg, header_match_mode), pk_h,
-                clm01_header_cfg, _normalize_header(clm01_header_cfg, header_match_mode), clm01_h,
-                created_at_header_cfg, _normalize_header(created_at_header_cfg, header_match_mode), created_h,
-            )
-
-        missing_required_actual: List[str] = []
+        missing_required: List[str] = []
         if not pk_h:
-            missing_required_actual.append(pk_header_cfg)
+            missing_required.append(pk_header_cfg)
         if not clm01_h:
-            missing_required_actual.append(clm01_header_cfg)
+            missing_required.append(clm01_header_cfg)
         if not created_h:
-            missing_required_actual.append(created_at_header_cfg)
+            missing_required.append(created_at_header_cfg)
 
-        if missing_required_actual:
-            norm_map_keys = sorted({_normalize_header(h, header_match_mode) for h in parsed_headers if h})
+        if missing_required:
             raise ValueError(
-                "Header validation failed.\n"
-                f"Missing required input column(s): {missing_required_actual}\n"
-                f"Delimiter used: {delimiter!r} (configured: {configured_delimiter!r})\n"
-                f"Header columns seen ({len(parsed_headers)}): {parsed_headers}\n\n"
-                f"{_field_display(fields)}\n\n"
-                f"Normalized header keys seen (mode={header_match_mode}): {norm_map_keys}\n\n"
-                "Most common cause: delimiter mismatch. If header columns show as ONE big string, fix io.delimiter.\n"
-                "If it’s a case/quotes/whitespace issue, set io.header_match to \"case_insensitive\" or \"normalized\"."
+                "Header validation failed.\\n"
+                f"Missing required input column(s): {missing_required}\\n"
+                f"Delimiter used: {delimiter!r} (configured: {configured_delimiter!r})\\n"
+                f"Header columns seen ({len(parsed_headers)}): {parsed_headers}\\n\\n"
+                f"{_field_display(fields)}\\n\\n"
+                "Most common cause: delimiter mismatch. If header columns show as ONE big string, fix io.delimiter.\\n"
+                "If it’s a case/quotes/whitespace issue, set io.header_match to \\"case_insensitive\\" or \\"normalized\\"."
             )
 
-        # resolve optional headers
+        # Resolve optional headers
         prev_h = _resolve_header(parsed_headers, prev_pk_header_cfg, header_match_mode) if prev_pk_header_cfg else None
         ref_f8_h = _resolve_header(parsed_headers, ref_f8_header_cfg, header_match_mode) if ref_f8_header_cfg else None
         sys_state_h = _resolve_header(parsed_headers, system_state_header_cfg, header_match_mode) if system_state_header_cfg else None
@@ -418,12 +400,13 @@ def read_events(
         sys_clm0503_h = _resolve_header(parsed_headers, system_clm0503_header_cfg, header_match_mode) if system_clm0503_header_cfg else None
         cms_icn_h = _resolve_header(parsed_headers, cms_icn_header_cfg, header_match_mode) if cms_icn_header_cfg else None
         cms_out_icn_h = _resolve_header(parsed_headers, cms_out_icn_header_cfg, header_match_mode) if cms_out_icn_header_cfg else None
+        create_by_h = _resolve_header(parsed_headers, create_by_header_cfg, header_match_mode) if create_by_header_cfg else None
+        update_by_h = _resolve_header(parsed_headers, update_by_header_cfg, header_match_mode) if update_by_header_cfg else None
 
         events: List[Event] = []
         total_rows = 0
         emitted = 0
         skipped_blank_clm01 = 0
-        sample_shown = 0
 
         for row in reader:
             total_rows += 1
@@ -433,24 +416,19 @@ def read_events(
             clm01_full = (row.get(clm01_h, "") or "").strip()
             created_at_raw = (row.get(created_h, "") or "").strip()
 
-            if debug_read and sample_shown < 3:
-                LOG.info("Sample row %d mapped values: pk=%r clm01=%r created_at=%r", sample_shown + 1, pk, clm01_full, created_at_raw)
-                sample_shown += 1
-
             if not clm01_full:
                 skipped_blank_clm01 += 1
                 continue
 
             if not pk:
                 raise ValueError(
-                    f"Row missing PK value under column {pk_h!r}. "
+                    f"Row {total_rows}: missing PK value under column {pk_h!r}. "
                     f"Check your mapping: pk -> {pk_header_cfg!r}."
                 )
 
             created_at = parse_datetime(created_at_raw, dt_fmts)
 
             base_id = clm01_full[:base_len]
-            clm_suffix = clm01_full[base_len:base_len + suffix_len] if len(clm01_full) >= base_len else ""
 
             prev_pk = (row.get(prev_h, "") or "").strip() if prev_h else ""
             ref_f8 = (row.get(ref_f8_h, "") or "").strip() if ref_f8_h else ""
@@ -460,12 +438,14 @@ def read_events(
             system_clm0503 = (row.get(sys_clm0503_h, "") or "").strip() if sys_clm0503_h else ""
             cms_icn = (row.get(cms_icn_h, "") or "").strip() if cms_icn_h else ""
             cms_out_icn = (row.get(cms_out_icn_h, "") or "").strip() if cms_out_icn_h else ""
+            create_by = (row.get(create_by_h, "") or "").strip() if create_by_h else ""
+            update_by = (row.get(update_by_h, "") or "").strip() if update_by_h else ""
 
             events.append(
                 Event(
+                    rownum=total_rows,
                     base_id=base_id,
                     clm01_full=clm01_full,
-                    clm_suffix=clm_suffix,
                     pk=pk,
                     prev_pk=prev_pk,
                     ref_f8=ref_f8,
@@ -475,6 +455,8 @@ def read_events(
                     system_clm0503=system_clm0503,
                     cms_icn=cms_icn,
                     cms_out_icn=cms_out_icn,
+                    create_by=create_by,
+                    update_by=update_by,
                     created_at=created_at,
                     raw=row,
                 )
@@ -482,88 +464,18 @@ def read_events(
             emitted += 1
 
         if debug_read:
-            LOG.info(
-                "Read summary: total_rows=%d emitted_events=%d skipped_blank_clm01=%d",
-                total_rows, emitted, skipped_blank_clm01
-            )
+            LOG.info("Read summary: total_rows=%d emitted_events=%d skipped_blank_clm01=%d", total_rows, emitted, skipped_blank_clm01)
 
         return events
 
 
 # -----------------------------
-# Thread building (PK chains)
+# Family interpretation
 # -----------------------------
-def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Finding]]:
-    """Build threads using prev_pk links; return threads + structural findings."""
-    findings: List[Finding] = []
-
-    by_pk: Dict[str, Event] = {e.pk: e for e in events_sorted}
-    children: Dict[str, List[str]] = defaultdict(list)
-    roots: List[str] = []
-
-    for e in events_sorted:
-        if e.prev_pk and e.prev_pk in by_pk:
-            children[e.prev_pk].append(e.pk)
-        elif e.prev_pk and e.prev_pk not in by_pk:
-            findings.append(
-                Finding(
-                    code="CHAIN_MISSING_PREV_PK",
-                    severity="WARN",
-                    message=f"Event references prev_pk '{e.prev_pk}' that is not present in this base group.",
-                    related_pks=(e.pk,),
-                )
-            )
-            roots.append(e.pk)
-        else:
-            roots.append(e.pk)
-
-    seen: Set[str] = set()
-    roots_ordered: List[str] = []
-    for e in events_sorted:
-        if e.pk in roots and e.pk not in seen:
-            roots_ordered.append(e.pk)
-            seen.add(e.pk)
-
-    threads: List[List[str]] = []
-
-    def dfs(path: List[str], current_pk: str) -> None:
-        kids = children.get(current_pk, [])
-        if not kids:
-            threads.append(path[:])
-            return
-
-        if len(kids) > 1:
-            findings.append(
-                Finding(
-                    code="CHAIN_SPLIT",
-                    severity="INFO",
-                    message=f"Thread splits from pk '{current_pk}' into {len(kids)} child events.",
-                    related_pks=(current_pk, *tuple(kids)),
-                )
-            )
-
-        for k in sorted(kids, key=lambda pk_: by_pk[pk_].created_at):
-            if k in path:
-                findings.append(
-                    Finding(
-                        code="CHAIN_CYCLE",
-                        severity="ERROR",
-                        message="Cycle detected in prev_pk chain.",
-                        related_pks=tuple(path + [k]),
-                    )
-                )
-                continue
-            dfs(path + [k], k)
-
-    for r in roots_ordered:
-        dfs([r], r)
-
-    return threads, findings
+def _upper(s: str) -> str:
+    return (s or "").upper()
 
 
-# -----------------------------
-# Derived interpretation helpers (v1.2.0)
-# -----------------------------
 def effective_clm0503(e: Event) -> str:
     """Prefer system_clm0503 when present, else inbound clm0503."""
     return (e.system_clm0503 or e.clm0503 or "").strip()
@@ -583,480 +495,328 @@ def action_type_from_clm0503(code: str) -> str:
     return ""
 
 
-def classify_event_tags(
-    e: Event,
-    base_ctx: Dict[str, Any],
-    rules_cfg: Dict[str, Any],
-) -> List[str]:
+def status_implies_action(system_status: str) -> str:
     """
-    Assign tags to an event using:
-      - event fields
-      - base-level context (e.g., first_accept_time)
-    These tags drive:
-      - timeline readability
-      - "unknown/unclassifiable" detection
+    Some systems embed action hints in status text (e.g., "... CORRECTION ..." or "... DELETE ...").
+    Returns 'CORRECTION' / 'DELETE' / ''.
     """
-    tags: List[str] = []
-
-    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
-    locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
-
-    if e.system_status in accepted_status_values:
-        tags.append("STATUS_ACCEPTED")
-    if e.system_status in locked_status_values:
-        tags.append("STATUS_LOCKED")
-
-    if e.system_state:
-        tags.append(f"STATE:{e.system_state}")
-
-    if e.cms_icn:
-        tags.append("HAS_CMS_ICN")
-    if e.cms_out_icn:
-        tags.append("HAS_CMS_OUT_ICN")
-
-    eff = effective_clm0503(e)
-    act = action_type_from_clm0503(eff)
-    if act:
-        tags.append(f"ACTION:{act}")
-
-    if eff in ("7", "8"):
-        if e.ref_f8:
-            tags.append("HAS_REF_F8")
-        else:
-            tags.append("MISSING_REF_F8")
-
-    expected_suffix = str(_get(rules_cfg, "expected_suffix", "00")).strip()
-    if expected_suffix and e.clm_suffix == expected_suffix:
-        tags.append("EXPECTED_SUFFIX")
-
-    first_accept_time: Optional[datetime] = base_ctx.get("first_accept_time")
-    if first_accept_time and e.system_status in locked_status_values and e.created_at < first_accept_time:
-        tags.append("LOCKED_BEFORE_ACCEPTANCE")
-
-    if e.prev_pk:
-        tags.append("HAS_PREV_PK")
-
-    return tags
+    su = _upper(system_status)
+    if "CORRECTION" in su:
+        return "CORRECTION"
+    if "DELETE" in su or "VOID" in su:
+        return "DELETE"
+    return ""
 
 
-# -----------------------------
-# Findings filtering (ignores)
-# -----------------------------
-def apply_ignores(findings: List[Finding], cfg: Dict[str, Any]) -> List[Finding]:
+def starts_with_any(s: str, prefixes: Sequence[str]) -> bool:
+    su = _upper(s).strip()
+    for p in prefixes:
+        if su.startswith(_upper(p).strip()):
+            return True
+    return False
+
+
+def assess_family(events_sorted: List[Event], cfg: Dict[str, Any]) -> Tuple[List[AssessedEvent], BaseSummary]:
     """
-    Filter findings based on config:
-      "ignores": {
-        "finding_codes": ["SYSTEM_FREQ_OVERRIDE"],
-        "severities": ["INFO"]
-      }
+    Build base-level context and then assess each event using that context.
     """
-    ignores = _get(cfg, "ignores", {})
-    ignore_codes = set(_get(ignores, "finding_codes", []))
-    ignore_sevs = set(_get(ignores, "severities", []))
+    rules = _must(cfg, "rules")
 
-    if not ignore_codes and not ignore_sevs:
-        return findings
+    accepted_status_values = set(_upper(x) for x in _get(rules, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
+    rejected_status_values = set(_upper(x) for x in _get(rules, "rejected_status_values", ["REJECTED"]))
+    terminal_status_values = accepted_status_values.union(rejected_status_values)
 
-    out: List[Finding] = []
-    for f in findings:
-        if ignore_codes and f.code in ignore_codes:
-            continue
-        if ignore_sevs and f.severity in ignore_sevs:
-            continue
-        out.append(f)
-    return out
+    locked_status_values = set(_upper(x) for x in _get(rules, "locked_status_values", ["LOCKED"]))
+    submitted_state_values = set(_upper(x) for x in _get(rules, "submitted_state_values", ["SUBMITTED"]))
 
+    manual_prefixes = _get(rules, "manual_user_prefixes", ["INC"])
 
-# -----------------------------
-# Rules
-# -----------------------------
-def _must_rules(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    return _must(cfg, "rules")
+    by_pk: Dict[str, Event] = {e.pk: e for e in events_sorted}
+    base_id = events_sorted[0].base_id
 
+    # Terminal time: earliest ACCEPTED or REJECTED
+    terminal_events = [e for e in events_sorted if _upper(e.system_status) in terminal_status_values]
+    first_terminal_time: Optional[datetime] = min((e.created_at for e in terminal_events), default=None)
+    terminal_statuses_seen = sorted({e.system_status for e in terminal_events if e.system_status})
 
-def rule_expected_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    Typical expectation:
-      - suffix '00' should eventually reach an “ACCEPTED”-like status.
-    If not seen, warn.
-    """
-    rules_cfg = _must_rules(cfg)
-    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
-    expected_suffix = str(_get(rules_cfg, "expected_suffix", "00")).strip()
+    # Manual intervention flag for family
+    family_manual = any(starts_with_any(e.create_by, manual_prefixes) or starts_with_any(e.update_by, manual_prefixes) for e in events_sorted)
+    manual_flag = "Y" if family_manual else "N"
 
-    accepted = [e for e in events_sorted if e.system_status in accepted_status_values]
-    accepted_suffix = [e for e in accepted if e.clm_suffix == expected_suffix]
+    # LOCKED presence
+    has_locked = any(_upper(e.system_status) in locked_status_values for e in events_sorted)
 
-    findings: List[Finding] = []
-    if not accepted_suffix:
-        if accepted:
-            findings.append(
-                Finding(
-                    code="ACCEPTED_BUT_NOT_EXPECTED_SUFFIX",
-                    severity="WARN",
-                    message=f"Acceptance exists, but not for expected suffix '{expected_suffix}'.",
-                    related_pks=tuple(e.pk for e in accepted),
-                )
+    # Timeline scan for inflight logic
+    inflight_pk: str = ""
+    inflight_state: str = ""
+
+    assessed: List[AssessedEvent] = []
+    codes_for_headline: List[Tuple[str, str]] = []  # (severity, code)
+
+    for e in events_sorted:
+        codes: List[str] = []
+        notes: List[str] = []
+        related_pk = ""
+
+        eff_freq = effective_clm0503(e)
+        action = action_type_from_clm0503(eff_freq) or status_implies_action(e.system_status)
+        implied_action = status_implies_action(e.system_status)
+        action_for_rules = action if action else implied_action
+
+        # Manual flag (per event)
+        event_manual = starts_with_any(e.create_by, manual_prefixes) or starts_with_any(e.update_by, manual_prefixes)
+        if event_manual:
+            codes.append("MANUAL_TOUCH")
+            notes.append("create_by/update_by indicates manual work")
+
+        # Parent link checks for CORRECTION / DELETE
+        action_requires_parent = action_for_rules in ("CORRECTION", "DELETE")
+        if action_requires_parent and not e.prev_pk:
+            codes.append("MISSING_PARENT_FOR_ACTION")
+            notes.append(f"{action_for_rules} indicated but prev_pk blank")
+
+        if e.prev_pk and e.prev_pk not in by_pk:
+            codes.append("PARENT_PK_NOT_FOUND")
+            notes.append("prev_pk not present in this base group")
+
+        # REF*F8 expectations for 7/8
+        if eff_freq in ("7", "8") and not e.ref_f8:
+            codes.append("MISSING_REF_F8")
+            notes.append("CLM05-3 7/8 but REF*F8 blank")
+
+        # LOCKED understanding logic
+        if _upper(e.system_status) in locked_status_values:
+            prior_events = [p for p in events_sorted if p.created_at < e.created_at]
+            if not prior_events:
+                codes.append("LOCKED_WITH_NO_PRIOR")
+                notes.append("LOCKED but no earlier event exists in family")
+
+            if first_terminal_time is None or e.created_at < first_terminal_time:
+                codes.append("LOCKED_BEFORE_TERMINAL")
+                if inflight_pk:
+                    codes.append("LOCKED_WAITING_ON_INFLIGHT")
+                    related_pk = inflight_pk
+                    notes.append(f"LOCKED while inflight exists (waiting on {inflight_pk})")
+                else:
+                    notes.append("LOCKED before any ACCEPTED/REJECTED observed")
+            else:
+                codes.append("LOCKED_AFTER_TERMINAL")
+                notes.append("LOCKED occurred after terminal status (review)")
+
+        # Inflight tracking update (after we assess current event)
+        if _upper(e.system_state) in submitted_state_values and _upper(e.system_status) not in terminal_status_values:
+            inflight_pk = e.pk
+            inflight_state = e.system_state
+        if _upper(e.system_status) in terminal_status_values:
+            inflight_pk = ""
+            inflight_state = ""
+
+        # Determine severity / confidence
+        severity = "OK"
+        confidence = "MED"
+
+        error_codes = {"MISSING_PARENT_FOR_ACTION", "PARENT_PK_NOT_FOUND"}
+        warn_codes = {"MISSING_REF_F8", "LOCKED_WITH_NO_PRIOR", "LOCKED_BEFORE_TERMINAL", "LOCKED_AFTER_TERMINAL"}
+
+        if any(c in error_codes for c in codes):
+            severity = "ERROR"
+        elif any(c in warn_codes for c in codes):
+            severity = "WARN"
+
+        if "LOCKED_WAITING_ON_INFLIGHT" in codes:
+            confidence = "HIGH"
+        if "PARENT_PK_NOT_FOUND" in codes or "MISSING_PARENT_FOR_ACTION" in codes:
+            confidence = "LOW"
+        if not codes:
+            confidence = "HIGH"
+
+        codes_str = ";".join(sorted(set(codes))) if codes else ""
+        note_str = "; ".join(notes[:2]) if notes else ""
+
+        assessed.append(
+            AssessedEvent(
+                event=e,
+                assessment_severity=severity,
+                understanding_confidence=confidence,
+                assessment_codes=codes_str,
+                assessment_note=note_str,
+                related_pk=related_pk,
             )
-        else:
-            findings.append(
-                Finding(
-                    code="MISSING_ACCEPTANCE",
-                    severity="WARN",
-                    message=f"No event found with an accepted status for suffix '{expected_suffix}'.",
-                    related_pks=tuple(e.pk for e in events_sorted[:3]),
-                )
-            )
-    return findings
-
-
-def rule_locked_before_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    Detect LOCKED events that occurred before the first accepted event timestamp.
-    Often indicates a later action arrived while earlier processing hadn't completed.
-    """
-    rules_cfg = _must_rules(cfg)
-    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
-    locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
-
-    accepted_events = [e for e in events_sorted if e.system_status in accepted_status_values]
-    if not accepted_events:
-        return []
-
-    first_accept_time = min(e.created_at for e in accepted_events)
-    locked_early = [e for e in events_sorted if e.system_status in locked_status_values and e.created_at < first_accept_time]
-
-    if not locked_early:
-        return []
-
-    return [
-        Finding(
-            code="LOCKED_BEFORE_ACCEPTANCE",
-            severity="WARN",
-            message="Found LOCKED event(s) that occurred before the first accepted event; likely queued behind earlier processing.",
-            related_pks=tuple(e.pk for e in locked_early),
         )
-    ]
+
+        if severity != "OK" and codes:
+            codes_for_headline.append((severity, sorted(set(codes))[0]))
+
+    headline_severity = "OK"
+    headline_code = "OK"
+    if codes_for_headline:
+        if any(sev == "ERROR" for sev, _ in codes_for_headline):
+            headline_severity = "ERROR"
+            headline_code = next(code for sev, code in codes_for_headline if sev == "ERROR")
+        else:
+            headline_severity = "WARN"
+            headline_code = next(code for sev, code in codes_for_headline if sev == "WARN")
+
+    created_min = min(e.created_at for e in events_sorted)
+    created_max = max(e.created_at for e in events_sorted)
+
+    base_summary = BaseSummary(
+        base_id=base_id,
+        event_count=len(events_sorted),
+        created_min_utc=created_min.isoformat(),
+        created_max_utc=created_max.isoformat(),
+        manual_flag=manual_flag,
+        first_terminal_utc=first_terminal_time.isoformat() if first_terminal_time else "",
+        terminal_statuses_seen=";".join(terminal_statuses_seen),
+        has_locked="Y" if has_locked else "N",
+        headline_severity=headline_severity,
+        headline_code=headline_code,
+    )
+
+    return assessed, base_summary
 
 
-def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    For CLM05-3 = 7 or 8, expect REF*F8 to be populated.
-    Checks both inbound clm0503 and system_clm0503 (if present).
-    """
-    _ = cfg
-    findings: List[Finding] = []
-    for e in events_sorted:
-        freq_candidates = {e.clm0503.strip(), e.system_clm0503.strip()}
-        freq_candidates.discard("")
-        if freq_candidates.intersection({"7", "8"}) and not e.ref_f8:
-            findings.append(
-                Finding(
-                    code="MISSING_REF_F8_FOR_7_8",
-                    severity="WARN",
-                    message="Correction/Void indicated (CLM05-3 7/8) but REF*F8 is blank.",
-                    related_pks=(e.pk,),
-                )
-            )
-    return findings
-
-
-def rule_system_freq_differs(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """Informational: system-altered frequency code differs from inbound frequency code."""
-    _ = cfg
-    findings: List[Finding] = []
-    for e in events_sorted:
-        if e.clm0503 and e.system_clm0503 and e.clm0503 != e.system_clm0503:
-            findings.append(
-                Finding(
-                    code="SYSTEM_FREQ_OVERRIDE",
-                    severity="INFO",
-                    message=f"System frequency differs from inbound frequency (inbound={e.clm0503}, system={e.system_clm0503}).",
-                    related_pks=(e.pk,),
-                )
-            )
-    return findings
-
-
-def rule_unknown_event_classification(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    v1.2.0:
-    If an event ends up with essentially no meaningful tags (after applying current logic + context),
-    flag it so you can decide whether it should be ignored, or whether we need a new rule.
-    """
-    rules_cfg = _must_rules(cfg)
-
-    # If you want to be strict, set this to "WARN". Default WARN.
-    severity = str(_get(rules_cfg, "unknown_event_severity", "WARN")).upper()
-    if severity not in ("INFO", "WARN", "ERROR"):
-        severity = "WARN"
-
-    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
-    # If base has absolutely no status/state data anywhere, don’t spam "unknown classification"
-    any_signal = any((e.system_status or e.system_state or e.clm0503 or e.system_clm0503) for e in events_sorted)
-    if not any_signal:
-        return []
-
-    # Base context
-    first_accept_time: Optional[datetime] = None
-    accepted_events = [e for e in events_sorted if e.system_status in accepted_status_values]
-    if accepted_events:
-        first_accept_time = min(e.created_at for e in accepted_events)
-
-    base_ctx = {"first_accept_time": first_accept_time}
-
-    findings: List[Finding] = []
-    for e in events_sorted:
-        tags = classify_event_tags(e, base_ctx, rules_cfg)
-
-        # "Meaningful" tags: if you only get STATE:... but nothing else, that might still be meaningful.
-        # We'll keep the threshold simple for now:
-        meaningful = [t for t in tags if not t.startswith("STATE:")]
-
-        # If event has no status/state AND no clm0503/system_clm0503, skip.
-        if not (e.system_status or e.system_state or e.clm0503 or e.system_clm0503):
-            continue
-
-        if not meaningful:
-            findings.append(
-                Finding(
-                    code="UNKNOWN_EVENT_CLASSIFICATION",
-                    severity=severity,
-                    message=(
-                        "Event could not be classified by current rules/context. "
-                        f"(clm01={e.clm01_full}, created_at={e.created_at.isoformat()}, "
-                        f"state={e.system_state!r}, status={e.system_status!r}, "
-                        f"clm0503={e.clm0503!r}, sys_clm0503={e.system_clm0503!r})"
-                    ),
-                    related_pks=(e.pk,),
-                )
-            )
-
-    return findings
-
-
-RULES = [
-    rule_expected_acceptance,
-    rule_locked_before_acceptance,
-    rule_correction_void_requires_f8,
-    rule_system_freq_differs,
-    rule_unknown_event_classification,
-]
-
-
-# -----------------------------
-# Digest + summary
-# -----------------------------
-def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
-    """Group events by base_id, order by created_at, build threads, run rules, and return reports."""
+def analyze(events: List[Event], cfg: Dict[str, Any]) -> Tuple[List[AssessedEvent], List[BaseSummary]]:
+    """Group by base_id, assess each family, return flat assessed events and base summaries."""
     grouped: Dict[str, List[Event]] = defaultdict(list)
     for e in events:
         grouped[e.base_id].append(e)
 
-    reports: List[BaseGroupReport] = []
+    all_assessed: List[AssessedEvent] = []
+    all_bases: List[BaseSummary] = []
 
-    for base_id, group_events in grouped.items():
+    for _, group_events in grouped.items():
         group_sorted = sorted(group_events, key=lambda e: (e.created_at, e.pk))
+        assessed, base_summary = assess_family(group_sorted, cfg)
+        all_assessed.extend(assessed)
+        all_bases.append(base_summary)
 
-        threads, thread_findings = build_threads(group_sorted)
-
-        findings: List[Finding] = []
-        findings.extend(thread_findings)
-        for rule in RULES:
-            findings.extend(rule(group_sorted, cfg))
-
-        # apply ignores (v1.2.0)
-        findings = apply_ignores(findings, cfg)
-
-        created_min = min(e.created_at for e in group_sorted)
-        created_max = max(e.created_at for e in group_sorted)
-
-        severity_rank = {"ERROR": 0, "WARN": 1, "INFO": 2}
-        findings_sorted = sorted(findings, key=lambda f: (severity_rank.get(f.severity, 9), f.code, f.message))
-
-        reports.append(
-            BaseGroupReport(
-                base_id=base_id,
-                created_min=created_min,
-                created_max=created_max,
-                events_sorted=group_sorted,
-                threads=threads,
-                findings=findings_sorted,
-            )
-        )
-
-    reports.sort(key=lambda r: (r.created_min, r.base_id))
-    return reports
+    all_assessed.sort(key=lambda ae: (ae.event.created_at, ae.event.base_id, ae.event.pk))
+    all_bases.sort(key=lambda b: (b.created_min_utc, b.base_id))
+    return all_assessed, all_bases
 
 
-def _count_findings(findings: Iterable[Finding]) -> Dict[str, int]:
-    out = {"ERROR": 0, "WARN": 0, "INFO": 0}
-    for f in findings:
-        out[f.severity] = out.get(f.severity, 0) + 1
-    return out
+# -----------------------------
+# CSV outputs
+# -----------------------------
+def write_events_csv(assessed: List[AssessedEvent], out_path: Path) -> None:
+    """Write per-event CSV."""
+    fieldnames = [
+        "base_id",
+        "pk",
+        "prev_pk",
+        "created_at_utc",
+        "clm01_full",
+        "system_state",
+        "system_status",
+        "effective_clm0503",
+        "action_type",
+        "ref_f8",
+        "cms_icn",
+        "cms_out_icn",
+        "create_by",
+        "update_by",
+        "assessment_severity",
+        "understanding_confidence",
+        "assessment_codes",
+        "assessment_note",
+        "related_pk",
+        "rownum",
+    ]
 
-
-def _headline_for_base(findings: List[Finding]) -> str:
-    if not findings:
-        return "OK"
-    for sev in ("ERROR", "WARN", "INFO"):
-        for f in findings:
-            if f.severity == sev:
-                return f.code
-    return findings[0].code
-
-
-def _has_status(events: List[Event], values: Set[str]) -> bool:
-    return any(e.system_status in values for e in events)
-
-
-def _latest_nonblank(values: List[str]) -> str:
-    for v in reversed(values):
-        if v:
-            return v
-    return ""
-
-
-def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert reports to JSON-serializable structure with:
-      - top-level summary
-      - per-base details including timeline[] (v1.2.0)
-    """
-    rules_cfg = _must(cfg, "rules")
-    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
-    locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
-
-    base_rollup: List[Dict[str, Any]] = []
-    all_findings: List[Finding] = []
-    all_events_count = 0
-
-    for r in reports:
-        all_events_count += len(r.events_sorted)
-        all_findings.extend(r.findings)
-
-        latest_status = _latest_nonblank([e.system_status for e in r.events_sorted])
-        latest_state = _latest_nonblank([e.system_state for e in r.events_sorted])
-
-        counts = _count_findings(r.findings)
-        base_rollup.append(
-            {
-                "base_id": r.base_id,
-                "created_min_utc": r.created_min.isoformat(),
-                "created_max_utc": r.created_max.isoformat(),
-                "event_count": len(r.events_sorted),
-                "latest_system_status": latest_status,
-                "latest_system_state": latest_state,
-                "has_acceptance": _has_status(r.events_sorted, accepted_status_values),
-                "has_locked": _has_status(r.events_sorted, locked_status_values),
-                "headline": _headline_for_base(r.findings),
-                "finding_counts": counts,
-            }
-        )
-
-    totals_by_sev = _count_findings(all_findings)
-    bases_with_warn_or_error = sum(
-        1 for r in reports if any(f.severity in ("WARN", "ERROR") for f in r.findings)
-    )
-
-    out: Dict[str, Any] = {
-        "app": {"name": APP_NAME, "version": APP_VERSION},
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "summary": {
-            "base_count": len(reports),
-            "event_count": all_events_count,
-            "findings_total": len(all_findings),
-            "findings_by_severity": totals_by_sev,
-            "bases_with_warn_or_error": bases_with_warn_or_error,
-            "base_rollup": base_rollup,
-        },
-        "bases": [],
-    }
-
-    for r in reports:
-        # base context used for per-event classification tags
-        first_accept_time: Optional[datetime] = None
-        accepted_events = [e for e in r.events_sorted if e.system_status in accepted_status_values]
-        if accepted_events:
-            first_accept_time = min(e.created_at for e in accepted_events)
-
-        base_ctx = {"first_accept_time": first_accept_time}
-
-        timeline = []
-        for e in r.events_sorted:
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for ae in assessed:
+            e = ae.event
             eff = effective_clm0503(e)
-            act = action_type_from_clm0503(eff)
-            tags = classify_event_tags(e, base_ctx, rules_cfg)
-
-            timeline.append(
+            act = action_type_from_clm0503(eff) or status_implies_action(e.system_status)
+            w.writerow(
                 {
+                    "base_id": e.base_id,
                     "pk": e.pk,
                     "prev_pk": e.prev_pk,
-                    "clm01_full": e.clm01_full,
                     "created_at_utc": e.created_at.isoformat(),
+                    "clm01_full": e.clm01_full,
                     "system_state": e.system_state,
                     "system_status": e.system_status,
                     "effective_clm0503": eff,
                     "action_type": act,
-                    "classification_tags": tags,
+                    "ref_f8": e.ref_f8,
+                    "cms_icn": e.cms_icn,
+                    "cms_out_icn": e.cms_out_icn,
+                    "create_by": e.create_by,
+                    "update_by": e.update_by,
+                    "assessment_severity": ae.assessment_severity,
+                    "understanding_confidence": ae.understanding_confidence,
+                    "assessment_codes": ae.assessment_codes,
+                    "assessment_note": ae.assessment_note,
+                    "related_pk": ae.related_pk,
+                    "rownum": e.rownum,
                 }
             )
 
-        out["bases"].append(
-            {
-                "base_id": r.base_id,
-                "created_min_utc": r.created_min.isoformat(),
-                "created_max_utc": r.created_max.isoformat(),
-                "event_count": len(r.events_sorted),
-                "threads": r.threads,
-                "findings": [dataclasses.asdict(f) for f in r.findings],
 
-                # v1.2.0: the compact, human-friendly view you asked for
-                "timeline": timeline,
-
-                # existing detailed event list (still useful for downstream filters)
-                "events": [
-                    {
-                        "pk": e.pk,
-                        "prev_pk": e.prev_pk,
-                        "created_at_utc": e.created_at.isoformat(),
-                        "clm01_full": e.clm01_full,
-                        "clm_suffix": e.clm_suffix,
-                        "ref_f8": e.ref_f8,
-                        "system_status": e.system_status,
-                        "system_state": e.system_state,
-                        "clm0503": e.clm0503,
-                        "system_clm0503": e.system_clm0503,
-                        "cms_icn": e.cms_icn,
-                        "cms_out_icn": e.cms_out_icn,
-                    }
-                    for e in r.events_sorted
-                ],
-            }
-        )
-
-    return out
-
-
-def write_findings_csv(reports: List[BaseGroupReport], out_path: Path) -> None:
-    """Write a flat findings CSV for easy filtering/sorting."""
-    rows: List[Dict[str, str]] = []
-    for r in reports:
-        for f in r.findings:
-            rows.append(
-                {
-                    "base_id": r.base_id,
-                    "severity": f.severity,
-                    "code": f.code,
-                    "message": f.message,
-                    "related_pks": ",".join(f.related_pks),
-                }
-            )
+def write_bases_csv(bases: List[BaseSummary], out_path: Path) -> None:
+    """Write per-base summary CSV."""
+    fieldnames = [
+        "base_id",
+        "event_count",
+        "created_min_utc",
+        "created_max_utc",
+        "manual_flag",
+        "first_terminal_utc",
+        "terminal_statuses_seen",
+        "has_locked",
+        "headline_severity",
+        "headline_code",
+    ]
 
     with out_path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["base_id", "severity", "code", "message", "related_pks"])
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        w.writerows(rows)
+        for b in bases:
+            w.writerow(
+                {
+                    "base_id": b.base_id,
+                    "event_count": b.event_count,
+                    "created_min_utc": b.created_min_utc,
+                    "created_max_utc": b.created_max_utc,
+                    "manual_flag": b.manual_flag,
+                    "first_terminal_utc": b.first_terminal_utc,
+                    "terminal_statuses_seen": b.terminal_statuses_seen,
+                    "has_locked": b.has_locked,
+                    "headline_severity": b.headline_severity,
+                    "headline_code": b.headline_code,
+                }
+            )
+
+
+# -----------------------------
+# Console helper
+# -----------------------------
+def print_base_console(assessed: List[AssessedEvent], base_id: str) -> None:
+    """Print a compact timeline for one base_id."""
+    rows = [ae for ae in assessed if ae.event.base_id == base_id]
+    if not rows:
+        print(f"No base_id found: {base_id}")
+        return
+
+    rows.sort(key=lambda ae: (ae.event.created_at, ae.event.pk))
+    print(f"\\nBASE {base_id} | events={len(rows)}")
+    print("-" * 120)
+    print("created_at_utc           | pk            | prev_pk       | clm01_full             | state        | status       | sev  | conf | codes")
+    print("-" * 120)
+    for ae in rows:
+        e = ae.event
+        created = e.created_at.isoformat()[:19]
+        pk = (e.pk or "")[:12]
+        prev = (e.prev_pk or "")[:12]
+        clm01 = (e.clm01_full or "")[:20]
+        state = (e.system_state or "")[:12]
+        status = (e.system_status or "")[:12]
+        codes = (ae.assessment_codes or "")[:40]
+        print(f"{created:<21} | {pk:<12} | {prev:<12} | {clm01:<20} | {state:<12} | {status:<12} | {ae.assessment_severity:<4} | {ae.understanding_confidence:<4} | {codes}")
 
 
 # -----------------------------
@@ -1064,12 +824,14 @@ def write_findings_csv(reports: List[BaseGroupReport], out_path: Path) -> None:
 # -----------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog=APP_NAME)
-    p.add_argument("--config", required=True, help="Path to config JSON.")
-    p.add_argument("--input", required=True, help="Path to input delimited file.")
-    p.add_argument("--out", required=True, help="Path to output JSON report.")
-    p.add_argument("--out-csv", default="", help="Optional: path to findings CSV.")
+    p.add_argument("--version", action="store_true", help="Print app version and exit.")
+    p.add_argument("--config", help="Path to config JSON.")
+    p.add_argument("--input", help="Path to input delimited file.")
+    p.add_argument("--out", help="Path to EVENTS output CSV.")
+    p.add_argument("--out-bases", default="", help="Optional: path to BASES summary CSV. Default: <out>_bases.csv")
     p.add_argument("--debug-read", action="store_true", help="Print detailed input/header/mapping diagnostics.")
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARN, ERROR")
+    p.add_argument("--print-base", default="", help="Optional: print console timeline for this base_id.")
     return p.parse_args(argv)
 
 
@@ -1080,13 +842,21 @@ def configure_logging(level: str) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    if args.version:
+        print(f"{APP_NAME} v{APP_VERSION}")
+        return 0
+
     configure_logging(args.log_level)
+
+    if not args.config or not args.input or not args.out:
+        raise ValueError("Missing required args. Use: --config <file> --input <file> --out <events.csv>")
 
     print(f"{APP_NAME} v{APP_VERSION}")
 
     cfg_path = Path(args.config)
     in_path = Path(args.input)
-    out_path = Path(args.out)
+    out_events = Path(args.out)
 
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config not found: {cfg_path}")
@@ -1095,29 +865,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     events = read_events(in_path, cfg, debug_read=args.debug_read)
     if not events:
-        LOG.warning(
-            "No events were emitted after parsing. This usually means CLM01 is blank for all rows, "
-            "or your delimiter/header mapping does not match the file."
-        )
+        LOG.warning("No events read. This usually means CLM01 is blank for all rows, or delimiter/header mapping mismatch.")
 
-    reports = digest(events, cfg)
-    out_json = to_jsonable(reports, cfg)
+    assessed, bases = analyze(events, cfg)
 
-    out_path.write_text(json.dumps(out_json, indent=2), encoding="utf-8")
-    if args.out_csv:
-        write_findings_csv(reports, Path(args.out_csv))
+    write_events_csv(assessed, out_events)
 
-    print(f"Wrote report: {out_path}")
-    if args.out_csv:
-        print(f"Wrote findings CSV: {args.out_csv}")
+    out_bases = Path(args.out_bases) if args.out_bases else out_events.with_name(out_events.stem + "_bases.csv")
+    write_bases_csv(bases, out_bases)
 
-    summ = out_json.get("summary", {})
-    print(
-        f"Bases: {summ.get('base_count', 0)} | "
-        f"Events: {summ.get('event_count', 0)} | "
-        f"Findings: {summ.get('findings_total', 0)} | "
-        f"WARN/ERROR bases: {summ.get('bases_with_warn_or_error', 0)}"
-    )
+    print(f"Wrote events CSV: {out_events}")
+    print(f"Wrote bases  CSV: {out_bases}")
+    print(f"Bases: {len(bases)} | Events: {len(assessed)}")
+
+    if args.print_base:
+        print_base_console(assessed, args.print_base)
+
     return 0
 
 
