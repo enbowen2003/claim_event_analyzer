@@ -2,15 +2,12 @@
   "io": {
     "delimiter": "|",
     "encoding": "utf-8-sig",
-
     "datetime_formats": ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"],
-
     "header_match": "normalized",
     "sniff_delimiter": false
   },
   "grouping": {
-    "base_len": 10,
-    "suffix_len": 2
+    "base_len": 10
   },
   "fields": {
     "pk": "EVENT_ID",
@@ -23,11 +20,16 @@
     "system_clm0503": "SYS_CLM0503",
     "cms_icn": "CMS_ICN",
     "cms_out_icn": "CMS_OUT_ICN",
-    "created_at": "CREATE_DT"
+    "created_at": "CREATE_DT",
+    "create_by": "CREATE_BY",
+    "update_by": "UPDATE_BY"
   },
   "rules": {
-    "expected_suffix": "00",
     "accepted_status_values": ["CMS ACCEPTED", "ACCEPTED"],
-    "locked_status_values": ["LOCKED"]
+    "rejected_status_values": ["REJECTED"],
+    "locked_status_values": ["LOCKED"],
+    "submitted_state_values": ["SUBMITTED"],
+
+    "manual_user_prefixes": ["INC"]
   }
 }
