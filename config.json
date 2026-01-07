@@ -2,7 +2,10 @@
   "io": {
     "delimiter": "|",
     "encoding": "utf-8-sig",
-    "datetime_format": "ISO"
+    "datetime_format": "ISO",
+
+    "header_match": "exact",
+    "sniff_delimiter": false
   },
   "grouping": {
     "base_len": 10,
