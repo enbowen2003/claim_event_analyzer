@@ -2,9 +2,10 @@
   "io": {
     "delimiter": "|",
     "encoding": "utf-8-sig",
-    "datetime_format": "ISO",
 
-    "header_match": "exact",
+    "datetime_formats": ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"],
+
+    "header_match": "normalized",
     "sniff_delimiter": false
   },
   "grouping": {
