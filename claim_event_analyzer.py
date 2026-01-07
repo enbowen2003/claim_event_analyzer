@@ -2,7 +2,7 @@
 """
 claim_event_analyzer.py
 
-Version: 1.1.2
+Version: 1.2.0
 
 What this app does
 ------------------
@@ -16,40 +16,34 @@ and produces a report that includes:
 
 2) Per-base DETAILS:
    - ordered events
+   - a compact TIMELINE (CLM01 + timestamp + state/status + derived action)
    - prev_pk thread chains
    - rule-based findings (warnings/errors/infos)
 
-EDI context used
-----------------
-- CLM05-3 (Claim Frequency Type Code): 1=Original, 7=Replacement/Correction, 8=Void/Delete
-- REF*F8: Original Reference Number (often used to reference the prior/original claim for 7/8)
+Important behavioral note
+-------------------------
+We do NOT assume state/status can be “understood” from an event row in isolation.
+We compute some derived context at the BASE-ID level (e.g., acceptance timestamp),
+and then attach per-event "tags" / "classification" that can rely on that context.
+
+New in v1.2.0
+-------------
+- JSON now includes, per base_id:
+  - timeline[]: each item includes clm01_full, created_at, system_state, system_status,
+    effective_clm0503/action_type, and derived classification_tags.
+- Adds a rule that flags events that appear "unclassifiable" (UNKNOWN_EVENT_CLASSIFICATION),
+  i.e., the analyzer can’t assign any meaningful tags based on the current rules + context.
+- Adds configurable "ignores" to filter findings by code and/or severity.
 
 Install
 -------
 Python 3.10+ recommended (3.12 OK). Standard library only.
 
-Datetime parsing
-----------------
-Your timestamp format "M/D/CCYY HH:mm" is NOT ISO.
-
-Set in config:
-  "io": {
-    "datetime_format": "%m/%d/%Y %H:%M"
-  }
-
-If your data sometimes includes seconds, use:
-  "io": {
-    "datetime_formats": ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"]
-  }
-
-Typical usage
--------------
-python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json
-python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --out-csv findings.csv
-
-Debug input/header parsing
---------------------------
-python claim_event_analyzer.py --config config.claims.json --input events.csv --out report.json --debug-read --log-level DEBUG
+Usage
+-----
+python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json
+python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json --out-csv findings.csv
+python claim_event_analyzer.py --config config.claims.json --input events.txt --out report.json --debug-read --log-level DEBUG
 """
 
 from __future__ import annotations
@@ -68,7 +62,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 
 
 APP_NAME = "claim_event_analyzer"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 
 LOG = logging.getLogger(APP_NAME)
 
@@ -251,8 +245,7 @@ def parse_datetime(value: str, fmts: DateFmt) -> datetime:
       - special token "ISO" meaning datetime.fromisoformat.
 
     Returns an aware datetime in UTC.
-
-    Note: If input is naive (no tzinfo), we assume UTC in v1.x.
+    If input is naive (no tzinfo), we assume UTC in v1.x.
     """
     raw = (value or "").strip()
     if not raw:
@@ -304,7 +297,7 @@ def read_events(
     configured_delimiter = _get(io_cfg, "delimiter", ",")
     encoding = _get(io_cfg, "encoding", "utf-8-sig")
 
-    # v1.1.2: support datetime_formats (list) as preferred; fallback to datetime_format (single)
+    # supports datetime_formats (list) as preferred; fallback to datetime_format (single)
     dt_formats = _get(io_cfg, "datetime_formats", None)
     dt_format = _get(io_cfg, "datetime_format", "ISO")
     dt_fmts: DateFmt = dt_formats if dt_formats else dt_format
@@ -329,7 +322,6 @@ def read_events(
     cms_icn_header_cfg = _get(fields, "cms_icn", "")
     cms_out_icn_header_cfg = _get(fields, "cms_out_icn", "")
 
-    # validate internal keys exist
     missing_internal = [k for k in _required_internal_fields() if k not in fields]
     if missing_internal:
         raise ValueError(f"Config missing required internal mapping(s): {missing_internal}")
@@ -380,7 +372,7 @@ def read_events(
             for i, h in enumerate(parsed_headers[:25]):
                 LOG.info(_debug_header_chars(f"header[{i}]", h))
 
-        # resolve configured headers to actual parsed headers
+        # resolve required headers
         pk_h = _resolve_header(parsed_headers, pk_header_cfg, header_match_mode)
         clm01_h = _resolve_header(parsed_headers, clm01_header_cfg, header_match_mode)
         created_h = _resolve_header(parsed_headers, created_at_header_cfg, header_match_mode)
@@ -570,6 +562,112 @@ def build_threads(events_sorted: List[Event]) -> Tuple[List[List[str]], List[Fin
 
 
 # -----------------------------
+# Derived interpretation helpers (v1.2.0)
+# -----------------------------
+def effective_clm0503(e: Event) -> str:
+    """Prefer system_clm0503 when present, else inbound clm0503."""
+    return (e.system_clm0503 or e.clm0503 or "").strip()
+
+
+def action_type_from_clm0503(code: str) -> str:
+    """Map CLM05-3 to an action type label."""
+    code = (code or "").strip()
+    if code == "1":
+        return "ORIGINAL"
+    if code == "7":
+        return "CORRECTION"
+    if code == "8":
+        return "DELETE"
+    if code:
+        return f"UNKNOWN({code})"
+    return ""
+
+
+def classify_event_tags(
+    e: Event,
+    base_ctx: Dict[str, Any],
+    rules_cfg: Dict[str, Any],
+) -> List[str]:
+    """
+    Assign tags to an event using:
+      - event fields
+      - base-level context (e.g., first_accept_time)
+    These tags drive:
+      - timeline readability
+      - "unknown/unclassifiable" detection
+    """
+    tags: List[str] = []
+
+    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
+    locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
+
+    if e.system_status in accepted_status_values:
+        tags.append("STATUS_ACCEPTED")
+    if e.system_status in locked_status_values:
+        tags.append("STATUS_LOCKED")
+
+    if e.system_state:
+        tags.append(f"STATE:{e.system_state}")
+
+    if e.cms_icn:
+        tags.append("HAS_CMS_ICN")
+    if e.cms_out_icn:
+        tags.append("HAS_CMS_OUT_ICN")
+
+    eff = effective_clm0503(e)
+    act = action_type_from_clm0503(eff)
+    if act:
+        tags.append(f"ACTION:{act}")
+
+    if eff in ("7", "8"):
+        if e.ref_f8:
+            tags.append("HAS_REF_F8")
+        else:
+            tags.append("MISSING_REF_F8")
+
+    expected_suffix = str(_get(rules_cfg, "expected_suffix", "00")).strip()
+    if expected_suffix and e.clm_suffix == expected_suffix:
+        tags.append("EXPECTED_SUFFIX")
+
+    first_accept_time: Optional[datetime] = base_ctx.get("first_accept_time")
+    if first_accept_time and e.system_status in locked_status_values and e.created_at < first_accept_time:
+        tags.append("LOCKED_BEFORE_ACCEPTANCE")
+
+    if e.prev_pk:
+        tags.append("HAS_PREV_PK")
+
+    return tags
+
+
+# -----------------------------
+# Findings filtering (ignores)
+# -----------------------------
+def apply_ignores(findings: List[Finding], cfg: Dict[str, Any]) -> List[Finding]:
+    """
+    Filter findings based on config:
+      "ignores": {
+        "finding_codes": ["SYSTEM_FREQ_OVERRIDE"],
+        "severities": ["INFO"]
+      }
+    """
+    ignores = _get(cfg, "ignores", {})
+    ignore_codes = set(_get(ignores, "finding_codes", []))
+    ignore_sevs = set(_get(ignores, "severities", []))
+
+    if not ignore_codes and not ignore_sevs:
+        return findings
+
+    out: List[Finding] = []
+    for f in findings:
+        if ignore_codes and f.code in ignore_codes:
+            continue
+        if ignore_sevs and f.severity in ignore_sevs:
+            continue
+        out.append(f)
+    return out
+
+
+# -----------------------------
 # Rules
 # -----------------------------
 def _must_rules(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -577,6 +675,11 @@ def _must_rules(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def rule_expected_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
+    """
+    Typical expectation:
+      - suffix '00' should eventually reach an “ACCEPTED”-like status.
+    If not seen, warn.
+    """
     rules_cfg = _must_rules(cfg)
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     expected_suffix = str(_get(rules_cfg, "expected_suffix", "00")).strip()
@@ -608,6 +711,10 @@ def rule_expected_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) ->
 
 
 def rule_locked_before_acceptance(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
+    """
+    Detect LOCKED events that occurred before the first accepted event timestamp.
+    Often indicates a later action arrived while earlier processing hadn't completed.
+    """
     rules_cfg = _must_rules(cfg)
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
@@ -633,6 +740,10 @@ def rule_locked_before_acceptance(events_sorted: List[Event], cfg: Dict[str, Any
 
 
 def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
+    """
+    For CLM05-3 = 7 or 8, expect REF*F8 to be populated.
+    Checks both inbound clm0503 and system_clm0503 (if present).
+    """
     _ = cfg
     findings: List[Finding] = []
     for e in events_sorted:
@@ -651,6 +762,7 @@ def rule_correction_void_requires_f8(events_sorted: List[Event], cfg: Dict[str, 
 
 
 def rule_system_freq_differs(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
+    """Informational: system-altered frequency code differs from inbound frequency code."""
     _ = cfg
     findings: List[Finding] = []
     for e in events_sorted:
@@ -666,11 +778,69 @@ def rule_system_freq_differs(events_sorted: List[Event], cfg: Dict[str, Any]) ->
     return findings
 
 
+def rule_unknown_event_classification(events_sorted: List[Event], cfg: Dict[str, Any]) -> List[Finding]:
+    """
+    v1.2.0:
+    If an event ends up with essentially no meaningful tags (after applying current logic + context),
+    flag it so you can decide whether it should be ignored, or whether we need a new rule.
+    """
+    rules_cfg = _must_rules(cfg)
+
+    # If you want to be strict, set this to "WARN". Default WARN.
+    severity = str(_get(rules_cfg, "unknown_event_severity", "WARN")).upper()
+    if severity not in ("INFO", "WARN", "ERROR"):
+        severity = "WARN"
+
+    accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
+    # If base has absolutely no status/state data anywhere, don’t spam "unknown classification"
+    any_signal = any((e.system_status or e.system_state or e.clm0503 or e.system_clm0503) for e in events_sorted)
+    if not any_signal:
+        return []
+
+    # Base context
+    first_accept_time: Optional[datetime] = None
+    accepted_events = [e for e in events_sorted if e.system_status in accepted_status_values]
+    if accepted_events:
+        first_accept_time = min(e.created_at for e in accepted_events)
+
+    base_ctx = {"first_accept_time": first_accept_time}
+
+    findings: List[Finding] = []
+    for e in events_sorted:
+        tags = classify_event_tags(e, base_ctx, rules_cfg)
+
+        # "Meaningful" tags: if you only get STATE:... but nothing else, that might still be meaningful.
+        # We'll keep the threshold simple for now:
+        meaningful = [t for t in tags if not t.startswith("STATE:")]
+
+        # If event has no status/state AND no clm0503/system_clm0503, skip.
+        if not (e.system_status or e.system_state or e.clm0503 or e.system_clm0503):
+            continue
+
+        if not meaningful:
+            findings.append(
+                Finding(
+                    code="UNKNOWN_EVENT_CLASSIFICATION",
+                    severity=severity,
+                    message=(
+                        "Event could not be classified by current rules/context. "
+                        f"(clm01={e.clm01_full}, created_at={e.created_at.isoformat()}, "
+                        f"state={e.system_state!r}, status={e.system_status!r}, "
+                        f"clm0503={e.clm0503!r}, sys_clm0503={e.system_clm0503!r})"
+                    ),
+                    related_pks=(e.pk,),
+                )
+            )
+
+    return findings
+
+
 RULES = [
     rule_expected_acceptance,
     rule_locked_before_acceptance,
     rule_correction_void_requires_f8,
     rule_system_freq_differs,
+    rule_unknown_event_classification,
 ]
 
 
@@ -678,6 +848,7 @@ RULES = [
 # Digest + summary
 # -----------------------------
 def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
+    """Group events by base_id, order by created_at, build threads, run rules, and return reports."""
     grouped: Dict[str, List[Event]] = defaultdict(list)
     for e in events:
         grouped[e.base_id].append(e)
@@ -693,6 +864,9 @@ def digest(events: List[Event], cfg: Dict[str, Any]) -> List[BaseGroupReport]:
         findings.extend(thread_findings)
         for rule in RULES:
             findings.extend(rule(group_sorted, cfg))
+
+        # apply ignores (v1.2.0)
+        findings = apply_ignores(findings, cfg)
 
         created_min = min(e.created_at for e in group_sorted)
         created_max = max(e.created_at for e in group_sorted)
@@ -744,6 +918,11 @@ def _latest_nonblank(values: List[str]) -> str:
 
 
 def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert reports to JSON-serializable structure with:
+      - top-level summary
+      - per-base details including timeline[] (v1.2.0)
+    """
     rules_cfg = _must(cfg, "rules")
     accepted_status_values = set(_get(rules_cfg, "accepted_status_values", ["CMS ACCEPTED", "ACCEPTED"]))
     locked_status_values = set(_get(rules_cfg, "locked_status_values", ["LOCKED"]))
@@ -795,6 +974,34 @@ def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str
     }
 
     for r in reports:
+        # base context used for per-event classification tags
+        first_accept_time: Optional[datetime] = None
+        accepted_events = [e for e in r.events_sorted if e.system_status in accepted_status_values]
+        if accepted_events:
+            first_accept_time = min(e.created_at for e in accepted_events)
+
+        base_ctx = {"first_accept_time": first_accept_time}
+
+        timeline = []
+        for e in r.events_sorted:
+            eff = effective_clm0503(e)
+            act = action_type_from_clm0503(eff)
+            tags = classify_event_tags(e, base_ctx, rules_cfg)
+
+            timeline.append(
+                {
+                    "pk": e.pk,
+                    "prev_pk": e.prev_pk,
+                    "clm01_full": e.clm01_full,
+                    "created_at_utc": e.created_at.isoformat(),
+                    "system_state": e.system_state,
+                    "system_status": e.system_status,
+                    "effective_clm0503": eff,
+                    "action_type": act,
+                    "classification_tags": tags,
+                }
+            )
+
         out["bases"].append(
             {
                 "base_id": r.base_id,
@@ -803,6 +1010,11 @@ def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str
                 "event_count": len(r.events_sorted),
                 "threads": r.threads,
                 "findings": [dataclasses.asdict(f) for f in r.findings],
+
+                # v1.2.0: the compact, human-friendly view you asked for
+                "timeline": timeline,
+
+                # existing detailed event list (still useful for downstream filters)
                 "events": [
                     {
                         "pk": e.pk,
@@ -827,6 +1039,7 @@ def to_jsonable(reports: List[BaseGroupReport], cfg: Dict[str, Any]) -> Dict[str
 
 
 def write_findings_csv(reports: List[BaseGroupReport], out_path: Path) -> None:
+    """Write a flat findings CSV for easy filtering/sorting."""
     rows: List[Dict[str, str]] = []
     for r in reports:
         for f in r.findings:
